@@ -70,6 +70,8 @@ const unsafe fn opcode_dyn_mut(ptr: *mut (), metadata: usize) -> *mut RawOp<dyn 
 #[derive(PartialEq, Eq, Hash)]
 pub struct Key<T: ?Sized> {
     user_data: *mut (),
+    #[cfg(feature = "io-uring")]
+    buffer_select: bool,
     _p: PhantomData<Box<RawOp<T>>>,
 }
 
@@ -77,6 +79,7 @@ impl<T: ?Sized> Unpin for Key<T> {}
 
 impl<T: OpCode + 'static> Key<T> {
     /// Create [`RawOp`] and get the [`Key`] to it.
+    #[cfg(not(feature = "io-uring"))]
     pub(crate) fn new(driver: RawFd, op: T) -> Self {
         let header = Overlapped::new(driver);
         let raw_op = Box::new(RawOp {
@@ -88,6 +91,20 @@ impl<T: OpCode + 'static> Key<T> {
         });
         unsafe { Self::new_unchecked(Box::into_raw(raw_op) as _) }
     }
+
+    /// Create [`RawOp`] and get the [`Key`] to it.
+    #[cfg(feature = "io-uring")]
+    pub(crate) fn new(driver: RawFd, op: T, buffer_select: bool) -> Self {
+        let header = Overlapped::new(driver);
+        let raw_op = Box::new(RawOp {
+            header,
+            cancelled: false,
+            metadata: opcode_metadata::<T>(),
+            result: PushEntry::Pending(None),
+            op,
+        });
+        unsafe { Self::new_unchecked(Box::into_raw(raw_op) as _, buffer_select) }
+    }
 }
 
 impl<T: ?Sized> Key<T> {
@@ -98,9 +115,26 @@ impl<T: ?Sized> Key<T> {
     /// Caller needs to ensure that `T` does correspond to `user_data` in driver
     /// this `Key` is created with. In most cases, it is enough to let `T` be
     /// `dyn OpCode`.
+    #[cfg(not(feature = "io-uring"))]
     pub unsafe fn new_unchecked(user_data: usize) -> Self {
         Self {
             user_data: user_data as _,
+            _p: PhantomData,
+        }
+    }
+
+    /// Create a new `Key` with the given user data.
+    ///
+    /// # Safety
+    ///
+    /// Caller needs to ensure that `T` does correspond to `user_data` in driver
+    /// this `Key` is created with. In most cases, it is enough to let `T` be
+    /// `dyn OpCode`.
+    #[cfg(feature = "io-uring")]
+    pub unsafe fn new_unchecked(user_data: usize, buffer_select: bool) -> Self {
+        Self {
+            user_data: user_data as _,
+            buffer_select,
             _p: PhantomData,
         }
     }
@@ -176,6 +210,10 @@ impl<T: ?Sized> Key<T> {
     /// and [`Key::set_result`].
     pub(crate) unsafe fn into_box(mut self) -> Box<RawOp<dyn OpCode>> {
         Box::from_raw(self.as_dyn_mut_ptr())
+    }
+
+    pub(crate) fn buffer_select(&self) -> bool {
+        self.buffer_select
     }
 }
 

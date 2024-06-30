@@ -265,23 +265,23 @@ impl<S> Accept<S> {
 /// Receive data from remote.
 pub struct Recv<T: IoBufMut, S> {
     pub(crate) fd: SharedFd<S>,
-    pub(crate) buffer: T,
+    pub(crate) buffer: IoBufMutOrBufferGroup<T>,
     _p: PhantomPinned,
 }
 
 impl<T: IoBufMut, S> Recv<T, S> {
     /// Create [`Recv`].
-    pub fn new(fd: SharedFd<S>, buffer: T) -> Self {
+    pub fn new(fd: SharedFd<S>, buffer: impl Into<IoBufMutOrBufferGroup<T>>) -> Self {
         Self {
             fd,
-            buffer,
+            buffer: buffer.into(),
             _p: PhantomPinned,
         }
     }
 }
 
 impl<T: IoBufMut, S> IntoInner for Recv<T, S> {
-    type Inner = T;
+    type Inner = IoBufMutOrBufferGroup<T>;
 
     fn into_inner(self) -> Self::Inner {
         self.buffer

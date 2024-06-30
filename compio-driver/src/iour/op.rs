@@ -1,4 +1,4 @@
-use std::{ffi::CString, io, marker::PhantomPinned, os::fd::AsRawFd, pin::Pin};
+use std::{ffi::CString, io, marker::PhantomPinned, os::fd::AsRawFd, pin::Pin, ptr};
 
 use compio_buf::{
     BufResult, IntoInner, IoBuf, IoBufMut, IoSlice, IoSliceMut, IoVectoredBuf, IoVectoredBufMut,
@@ -34,6 +34,10 @@ impl<
         this.data = Some(data);
         res
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for OpenFile {
@@ -44,11 +48,19 @@ impl OpCode for OpenFile {
             .build()
             .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for CloseFile {
     fn create_entry(self: Pin<&mut Self>) -> OpEntry {
         opcode::Close::new(Fd(self.fd.as_raw_fd())).build().into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -79,6 +91,10 @@ impl<S: AsRawFd> OpCode for FileStat<S> {
         .flags(libc::AT_EMPTY_PATH)
         .build()
         .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -123,6 +139,10 @@ impl OpCode for PathStat {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl IntoInner for PathStat {
@@ -137,11 +157,25 @@ impl<T: IoBufMut, S: AsRawFd> OpCode for ReadAt<T, S> {
     fn create_entry(self: Pin<&mut Self>) -> OpEntry {
         let fd = Fd(self.fd.as_raw_fd());
         let offset = self.offset;
-        let slice = unsafe { self.get_unchecked_mut() }.buffer.as_mut_slice();
-        opcode::Read::new(fd, slice.as_mut_ptr() as _, slice.len() as _)
-            .offset(offset)
-            .build()
-            .into()
+        match &mut unsafe { self.get_unchecked_mut() }.buffer {
+            IoBufMutOrBufferGroup::Buffer(slice) => {
+                let slice = slice.as_mut_slice();
+                opcode::Read::new(fd, slice.as_mut_ptr() as _, slice.len() as _)
+                    .offset(offset)
+                    .build()
+                    .into()
+            }
+
+            IoBufMutOrBufferGroup::BufferGroup(id) => opcode::Read::new(fd, ptr::null_mut(), 0)
+                .offset(offset)
+                .buf_group(*id)
+                .build()
+                .into(),
+        }
+    }
+
+    fn buffer_select(&self) -> bool {
+        self.buffer.is_buffer_select()
     }
 }
 
@@ -158,6 +192,10 @@ impl<T: IoVectoredBufMut, S: AsRawFd> OpCode for ReadVectoredAt<T, S> {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoBuf, S: AsRawFd> OpCode for WriteAt<T, S> {
@@ -167,6 +205,10 @@ impl<T: IoBuf, S: AsRawFd> OpCode for WriteAt<T, S> {
             .offset(self.offset)
             .build()
             .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -183,6 +225,10 @@ impl<T: IoVectoredBuf, S: AsRawFd> OpCode for WriteVectoredAt<T, S> {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<S: AsRawFd> OpCode for Sync<S> {
@@ -196,6 +242,10 @@ impl<S: AsRawFd> OpCode for Sync<S> {
             .build()
             .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for Unlink {
@@ -205,6 +255,10 @@ impl OpCode for Unlink {
             .build()
             .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for CreateDir {
@@ -213,6 +267,10 @@ impl OpCode for CreateDir {
             .mode(self.mode)
             .build()
             .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -227,6 +285,10 @@ impl OpCode for Rename {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for Symlink {
@@ -238,6 +300,10 @@ impl OpCode for Symlink {
         )
         .build()
         .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -251,6 +317,10 @@ impl OpCode for HardLink {
         )
         .build()
         .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -268,6 +338,10 @@ impl OpCode for CreateSocket {
     fn call_blocking(self: Pin<&mut Self>) -> io::Result<usize> {
         Ok(syscall!(libc::socket(self.domain, self.socket_type, self.protocol))? as _)
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<S: AsRawFd> OpCode for ShutdownSocket<S> {
@@ -276,11 +350,19 @@ impl<S: AsRawFd> OpCode for ShutdownSocket<S> {
             .build()
             .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl OpCode for CloseSocket {
     fn create_entry(self: Pin<&mut Self>) -> OpEntry {
         opcode::Close::new(Fd(self.fd.as_raw_fd())).build().into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -295,6 +377,10 @@ impl<S: AsRawFd> OpCode for Accept<S> {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<S: AsRawFd> OpCode for Connect<S> {
@@ -303,15 +389,32 @@ impl<S: AsRawFd> OpCode for Connect<S> {
             .build()
             .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoBufMut, S: AsRawFd> OpCode for Recv<T, S> {
     fn create_entry(self: Pin<&mut Self>) -> OpEntry {
         let fd = self.fd.as_raw_fd();
-        let slice = unsafe { self.get_unchecked_mut() }.buffer.as_mut_slice();
-        opcode::Read::new(Fd(fd), slice.as_mut_ptr() as _, slice.len() as _)
-            .build()
-            .into()
+        match &mut unsafe { self.get_unchecked_mut() }.buffer {
+            IoBufMutOrBufferGroup::Buffer(slice) => {
+                let slice = slice.as_mut_slice();
+                opcode::Read::new(Fd(fd), slice.as_mut_ptr() as _, slice.len() as _)
+                    .build()
+                    .into()
+            }
+
+            IoBufMutOrBufferGroup::BufferGroup(id) => opcode::Read::new(Fd(fd), ptr::null_mut(), 0)
+                .buf_group(*id)
+                .build()
+                .into(),
+        }
+    }
+
+    fn buffer_select(&self) -> bool {
+        self.buffer.is_buffer_select()
     }
 }
 
@@ -327,6 +430,10 @@ impl<T: IoVectoredBufMut, S: AsRawFd> OpCode for RecvVectored<T, S> {
         .build()
         .into()
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoBuf, S: AsRawFd> OpCode for Send<T, S> {
@@ -335,6 +442,10 @@ impl<T: IoBuf, S: AsRawFd> OpCode for Send<T, S> {
         opcode::Write::new(Fd(self.fd.as_raw_fd()), slice.as_ptr(), slice.len() as _)
             .build()
             .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -349,6 +460,10 @@ impl<T: IoVectoredBuf, S: AsRawFd> OpCode for SendVectored<T, S> {
         )
         .build()
         .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -411,6 +526,10 @@ impl<T: IoBufMut, S: AsRawFd> OpCode for RecvFrom<T, S> {
         this.slice[0] = unsafe { this.buffer.as_io_slice_mut() };
         this.header.create_entry(&mut this.slice)
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoBufMut, S: AsRawFd> IntoInner for RecvFrom<T, S> {
@@ -445,6 +564,10 @@ impl<T: IoVectoredBufMut, S: AsRawFd> OpCode for RecvFromVectored<T, S> {
         let this = unsafe { self.get_unchecked_mut() };
         this.slice = unsafe { this.buffer.as_io_slices_mut() };
         this.header.create_entry(&mut this.slice)
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }
 
@@ -512,6 +635,10 @@ impl<T: IoBuf, S: AsRawFd> OpCode for SendTo<T, S> {
         this.slice[0] = unsafe { this.buffer.as_io_slice() };
         this.header.create_entry(&mut this.slice)
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoBuf, S> IntoInner for SendTo<T, S> {
@@ -546,6 +673,10 @@ impl<T: IoVectoredBuf, S: AsRawFd> OpCode for SendToVectored<T, S> {
         this.slice = unsafe { this.buffer.as_io_slices() };
         this.header.create_entry(&mut this.slice)
     }
+
+    fn buffer_select(&self) -> bool {
+        false
+    }
 }
 
 impl<T: IoVectoredBuf, S> IntoInner for SendToVectored<T, S> {
@@ -565,5 +696,9 @@ impl<S: AsRawFd> OpCode for PollOnce<S> {
         opcode::PollAdd::new(Fd(self.fd.as_raw_fd()), flags as _)
             .build()
             .into()
+    }
+
+    fn buffer_select(&self) -> bool {
+        false
     }
 }

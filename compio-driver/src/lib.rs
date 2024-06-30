@@ -5,6 +5,21 @@
 #![cfg_attr(feature = "once_cell_try", feature(once_cell_try))]
 #![warn(missing_docs)]
 
+use std::{
+    io,
+    task::{Poll, Waker},
+    time::Duration,
+};
+
+pub use asyncify::*;
+use compio_buf::BufResult;
+use compio_log::instrument;
+pub use fd::*;
+pub use key::Key;
+pub use sys::*;
+#[cfg(unix)]
+use unix::Overlapped;
+
 #[cfg(all(
     target_os = "linux",
     not(feature = "io-uring"),
@@ -12,30 +27,14 @@
 ))]
 compile_error!("You must choose at least one of these features: [\"io-uring\", \"polling\"]");
 
-use std::{
-    io,
-    task::{Poll, Waker},
-    time::Duration,
-};
-
-use compio_buf::BufResult;
-use compio_log::instrument;
-
+mod asyncify;
+mod fallback_buffer_pool;
+mod fd;
 mod key;
-pub use key::Key;
-
 pub mod op;
 #[cfg(unix)]
 #[cfg_attr(docsrs, doc(cfg(all())))]
 mod unix;
-#[cfg(unix)]
-use unix::Overlapped;
-
-mod asyncify;
-pub use asyncify::*;
-
-mod fd;
-pub use fd::*;
 
 cfg_if::cfg_if! {
     if #[cfg(windows)] {
@@ -52,8 +51,6 @@ cfg_if::cfg_if! {
         mod sys;
     }
 }
-
-pub use sys::*;
 
 #[cfg(windows)]
 #[macro_export]
@@ -261,7 +258,8 @@ impl Proactor {
     /// Push an operation into the driver, and return the unique key, called
     /// user-defined data, associated with it.
     pub fn push<T: OpCode + 'static>(&mut self, op: T) -> PushEntry<Key<T>, BufResult<usize, T>> {
-        let mut op = self.driver.create_op(op);
+        let buffer_select = op.buffer_select();
+        let mut op = self.driver.create_op(op, buffer_select);
         match self.driver.push(&mut op) {
             Poll::Pending => PushEntry::Pending(op),
             Poll::Ready(res) => {
@@ -321,12 +319,17 @@ impl AsRawFd for Proactor {
 #[derive(Debug)]
 pub(crate) struct Entry {
     user_data: usize,
+    buffer_id: Option<u16>,
     result: io::Result<usize>,
 }
 
 impl Entry {
-    pub(crate) fn new(user_data: usize, result: io::Result<usize>) -> Self {
-        Self { user_data, result }
+    pub(crate) fn new(user_data: usize, result: io::Result<usize>, buffer_id: Option<u16>) -> Self {
+        Self {
+            user_data,
+            buffer_id,
+            result,
+        }
     }
 
     /// The user-defined data returned by [`Proactor::push`].
@@ -356,7 +359,8 @@ impl<E: Extend<usize>> Extend<Entry> for OutEntries<'_, E> {
     fn extend<T: IntoIterator<Item = Entry>>(&mut self, iter: T) {
         self.entries.extend(iter.into_iter().filter_map(|e| {
             let user_data = e.user_data();
-            let mut op = unsafe { Key::<()>::new_unchecked(user_data) };
+            let buffer_select = e.buffer_id.is_some();
+            let mut op = unsafe { Key::<()>::new_unchecked(user_data, buffer_select) };
             if op.set_result(e.into_result()) {
                 // SAFETY: completed and cancelled.
                 let _ = unsafe { op.into_box() };

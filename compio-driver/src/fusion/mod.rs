@@ -1,11 +1,3 @@
-#[path = "../poll/mod.rs"]
-mod poll;
-
-#[path = "../iour/mod.rs"]
-mod iour;
-
-pub(crate) mod op;
-
 #[cfg_attr(all(doc, docsrs), doc(cfg(all())))]
 pub use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::{io, task::Poll, time::Duration};
@@ -15,7 +7,15 @@ pub(crate) use iour::{sockaddr_storage, socklen_t};
 pub use iour::{OpCode as IourOpCode, OpEntry};
 pub use poll::{Decision, OpCode as PollOpCode};
 
-use crate::{Key, OutEntries, ProactorBuilder};
+use crate::{fallback_buffer_pool, Key, OutEntries, ProactorBuilder};
+
+#[path = "../poll/mod.rs"]
+mod poll;
+
+#[path = "../iour/mod.rs"]
+mod iour;
+
+pub(crate) mod op;
 
 mod driver_type {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -109,6 +109,16 @@ mod driver_type {
 pub trait OpCode: PollOpCode + IourOpCode {}
 
 impl<T: PollOpCode + IourOpCode + ?Sized> OpCode for T {}
+
+enum FuseBufferPool {
+    Poll(fallback_buffer_pool::BufferPool),
+    IoUring(iour::buffer_pool::BufferPool),
+}
+
+enum FuseBorrowedBuffer<'a> {
+    Poll(fallback_buffer_pool::BorrowedBuffer<'a>),
+    IoUring(iour::buffer_pool::BorrowedBuffer<'a>),
+}
 
 #[allow(clippy::large_enum_variant)]
 enum FuseDriver {

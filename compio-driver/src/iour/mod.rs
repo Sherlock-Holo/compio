@@ -1,10 +1,24 @@
 #[cfg_attr(all(doc, docsrs), doc(cfg(all())))]
 #[allow(unused_imports)]
 pub use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::{io, os::fd::FromRawFd, pin::Pin, sync::Arc, task::Poll, time::Duration};
+use std::{cell::RefCell, io, os::fd::FromRawFd, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
 use compio_log::{instrument, trace, warn};
 use crossbeam_queue::SegQueue;
+use io_uring::{
+    cqueue::buffer_select,
+    opcode::{AsyncCancel, PollAdd},
+    squeue::Flags,
+    types::{Fd, SubmitArgs, Timespec},
+    IoUring,
+};
+use io_uring_buf_ring::IoUringBufRing;
+pub(crate) use libc::{sockaddr_storage, socklen_t};
+use slab::Slab;
+
+use self::buffer_pool::BufferPool;
+use crate::{syscall, AsyncifyPool, Entry, Key, OutEntries, ProactorBuilder};
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "io-uring-cqe32")] {
         use io_uring::cqueue::Entry32 as CEntry;
@@ -19,15 +33,7 @@ cfg_if::cfg_if! {
         use io_uring::squeue::Entry as SEntry;
     }
 }
-use io_uring::{
-    opcode::{AsyncCancel, PollAdd},
-    types::{Fd, SubmitArgs, Timespec},
-    IoUring,
-};
-pub(crate) use libc::{sockaddr_storage, socklen_t};
-
-use crate::{syscall, AsyncifyPool, Entry, Key, OutEntries, ProactorBuilder};
-
+pub(crate) mod buffer_pool;
 pub(crate) mod op;
 
 /// The created entry of [`OpCode`].
@@ -64,6 +70,8 @@ pub trait OpCode {
     fn call_blocking(self: Pin<&mut Self>) -> io::Result<usize> {
         unreachable!("this operation is asynchronous")
     }
+
+    fn buffer_select(&self) -> bool;
 }
 
 /// Low-level driver of io-uring.
@@ -72,6 +80,7 @@ pub(crate) struct Driver {
     notifier: Notifier,
     pool: AsyncifyPool,
     pool_completed: Arc<SegQueue<Entry>>,
+    buffer_group_id_gen: RefCell<Slab<()>>,
 }
 
 impl Driver {
@@ -105,6 +114,7 @@ impl Driver {
             notifier,
             pool: builder.create_or_get_thread_pool(),
             pool_completed: Arc::new(SegQueue::new()),
+            buffer_group_id_gen: Default::default(),
         })
     }
 
@@ -164,8 +174,8 @@ impl Driver {
         has_entry
     }
 
-    pub fn create_op<T: crate::sys::OpCode + 'static>(&self, op: T) -> Key<T> {
-        Key::new(self.as_raw_fd(), op)
+    pub fn create_op<T: crate::sys::OpCode + 'static>(&self, op: T, buffer_select: bool) -> Key<T> {
+        Key::new(self.as_raw_fd(), op, buffer_select)
     }
 
     pub fn attach(&mut self, _fd: RawFd) -> io::Result<()> {
@@ -215,21 +225,28 @@ impl Driver {
     ) -> Poll<io::Result<usize>> {
         instrument!(compio_log::Level::TRACE, "push", ?op);
         let user_data = op.user_data();
+        let buffer_select = op.buffer_select();
         let op_pin = op.as_op_pin();
         trace!("push RawOp");
         match op_pin.create_entry() {
-            OpEntry::Submission(entry) => {
+            OpEntry::Submission(mut entry) => {
+                if buffer_select {
+                    entry = entry.flags(Flags::BUFFER_SELECT);
+                }
                 #[allow(clippy::useless_conversion)]
                 self.push_raw(entry.user_data(user_data as _).into())?;
                 Poll::Pending
             }
             #[cfg(feature = "io-uring-sqe128")]
-            OpEntry::Submission128(entry) => {
+            OpEntry::Submission128(mut entry) => {
+                if buffer_select {
+                    entry = entry.flags(Flags::BUFFER_SELECT);
+                }
                 self.push_raw(entry.user_data(user_data as _))?;
                 Poll::Pending
             }
             OpEntry::Blocking => {
-                if self.push_blocking(user_data)? {
+                if self.push_blocking(user_data, buffer_select)? {
                     Poll::Pending
                 } else {
                     Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)))
@@ -238,16 +255,20 @@ impl Driver {
         }
     }
 
-    fn push_blocking(&mut self, user_data: usize) -> io::Result<bool> {
+    fn push_blocking(&mut self, user_data: usize, buffer_select: bool) -> io::Result<bool> {
         let handle = self.handle()?;
         let completed = self.pool_completed.clone();
         let is_ok = self
             .pool
             .dispatch(move || {
-                let mut op = unsafe { Key::<dyn crate::sys::OpCode>::new_unchecked(user_data) };
+                let mut op = unsafe {
+                    Key::<dyn crate::sys::OpCode>::new_unchecked(user_data, buffer_select)
+                };
                 let op_pin = op.as_op_pin();
                 let res = op_pin.call_blocking();
-                completed.push(Entry::new(user_data, res));
+                // here the None buffer id is ok, because the `op_pin.call_blocking` inner is
+                // unreachable!() :)
+                completed.push(Entry::new(user_data, res, None));
                 handle.notify().ok();
             })
             .is_ok();
@@ -274,6 +295,34 @@ impl Driver {
     pub fn handle(&self) -> io::Result<NotifyHandle> {
         self.notifier.handle()
     }
+
+    pub fn create_buffer_pool(
+        &self,
+        buffer_size: usize,
+        buffer_len: u16,
+    ) -> io::Result<BufferPool> {
+        let io_uring_buf_ring = IoUringBufRing::new(
+            &self.inner,
+            buffer_len as _,
+            self.buffer_group_id_gen.borrow_mut().insert(()) as _,
+            buffer_size,
+        )?;
+
+        Ok(BufferPool::new(io_uring_buf_ring))
+    }
+
+    pub fn release_buffer_pool(&self, buffer_pool: BufferPool) -> io::Result<()> {
+        let buffer_group = buffer_pool.buffer_group();
+        unsafe {
+            // Safety: TODO how to make it safe?
+            buffer_pool.into_inner().release(&self.inner)?;
+        }
+        self.buffer_group_id_gen
+            .borrow_mut()
+            .remove(buffer_group as _);
+
+        Ok(())
+    }
 }
 
 impl AsRawFd for Driver {
@@ -294,7 +343,7 @@ fn create_entry(entry: CEntry) -> Entry {
     } else {
         Ok(result as _)
     };
-    Entry::new(entry.user_data() as _, result)
+    Entry::new(entry.user_data() as _, result, buffer_select(entry.flags()))
 }
 
 fn timespec(duration: std::time::Duration) -> Timespec {

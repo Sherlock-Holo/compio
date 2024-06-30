@@ -112,29 +112,48 @@ impl CloseFile {
     }
 }
 
+#[derive(Debug)]
+pub enum IoBufMutOrBufferGroup<T: IoBufMut> {
+    Buffer(T),
+    #[cfg(feature = "io-uring")]
+    BufferGroup(u16),
+}
+
+impl<T: IoBufMut> From<T> for IoBufMutOrBufferGroup<T> {
+    fn from(value: T) -> Self {
+        Self::Buffer(value)
+    }
+}
+
+impl<T: IoBufMut> IoBufMutOrBufferGroup<T> {
+    pub(crate) fn is_buffer_select(&self) -> bool {
+        matches!(self, IoBufMutOrBufferGroup::BufferGroup(_))
+    }
+}
+
 /// Read a file at specified position into specified buffer.
 #[derive(Debug)]
 pub struct ReadAt<T: IoBufMut, S> {
     pub(crate) fd: SharedFd<S>,
     pub(crate) offset: u64,
-    pub(crate) buffer: T,
+    pub(crate) buffer: IoBufMutOrBufferGroup<T>,
     _p: PhantomPinned,
 }
 
 impl<T: IoBufMut, S> ReadAt<T, S> {
     /// Create [`ReadAt`].
-    pub fn new(fd: SharedFd<S>, offset: u64, buffer: T) -> Self {
+    pub fn new(fd: SharedFd<S>, offset: u64, buffer: impl Into<IoBufMutOrBufferGroup<T>>) -> Self {
         Self {
             fd,
             offset,
-            buffer,
+            buffer: buffer.into(),
             _p: PhantomPinned,
         }
     }
 }
 
 impl<T: IoBufMut, S> IntoInner for ReadAt<T, S> {
-    type Inner = T;
+    type Inner = IoBufMutOrBufferGroup<T>;
 
     fn into_inner(self) -> Self::Inner {
         self.buffer
